@@ -1,0 +1,483 @@
+diff --git a/deploy/lingbot_vla_v2_policy.py b/deploy/lingbot_vla_v2_policy.py
+index 96b9acb..3e5efac 100644
+--- a/deploy/lingbot_vla_v2_policy.py
++++ b/deploy/lingbot_vla_v2_policy.py
+@@ -435,6 +435,15 @@ class LingbotVLAv2Server:
+     def _infer_batch(self, observations, return_normalized=False):
+         if not isinstance(observations, (list, tuple)) or len(observations) == 0:
+             raise ValueError("batch observation must be a non-empty list")
++        # lingbot competition: multi-noise consensus. LB_NOISE_K=K>1 samples K action chunks per observation
++        # (independent flow-matching noise, batched) and aggregates them with LB_NOISE_AGG=mean|median.
++        noise_k = int(os.environ.get("LB_NOISE_K", "1"))
++        if noise_k > 1:
++            n_obs = len(observations)
++            observations = [obs for obs in observations for _ in range(noise_k)]
++            if not getattr(self, "_noise_k_logged", False):
++                print(f"[lb] multi-noise consensus: K={noise_k} agg={os.environ.get('LB_NOISE_AGG', 'mean')}", flush=True)
++                self._noise_k_logged = True
+         applied = [self._prepare_model_input(obs) for obs in observations] # bsize, dict{key }
+         batch_observation = {}
+         for key in applied[0].keys():
+@@ -454,6 +463,12 @@ class LingbotVLAv2Server:
+         )
+         
+         unnormalized_actions = self._unapply_batched_actions(applied, actions)
++        if noise_k > 1:
++            agg = np.median if os.environ.get("LB_NOISE_AGG", "mean") == "median" else np.mean
++            for key, value in unnormalized_actions.items():
++                unnormalized_actions[key] = agg(value.reshape(n_obs, noise_k, *value.shape[1:]), axis=1)
++            actions = actions.reshape(n_obs, noise_k, *actions.shape[1:])
++            actions = actions.median(dim=1).values if agg is np.median else actions.mean(dim=1)
+         if return_normalized:
+             return unnormalized_actions, actions
+         return unnormalized_actions
+diff --git a/lingbotvla/data/vla_data/base_dataset.py b/lingbotvla/data/vla_data/base_dataset.py
+index 71d62a0..a960995 100644
+--- a/lingbotvla/data/vla_data/base_dataset.py
++++ b/lingbotvla/data/vla_data/base_dataset.py
+@@ -112,7 +112,12 @@ class LeRobotDataset(BaseLeRobotDataset):
+                 # query timestamps are relative to the episode start.
+                 ep = self.meta.episodes[ep_idx]
+                 from_timestamp = ep[f"videos/{vid_key}/from_timestamp"]
+-                query_ts = [from_timestamp + ts for ts in query_ts]
++                # lingbot competition: in the official RoboTwin clean v3.0 package ~25% of cam_high episodes have
++                # a video segment 1-2 frames shorter than the parquet episode. Lookups near the episode end (the
++                # future frame clamps to the last parquet frame) then fail the tolerance check and the sample is
++                # silently replaced by a random one, under-sampling task endings. Clamp to the last video frame.
++                last_ts = ep[f"videos/{vid_key}/to_timestamp"] - from_timestamp - 1.0 / self.meta.fps
++                query_ts = [from_timestamp + min(ts, last_ts) for ts in query_ts]
+ 
+             video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
+             frames = decode_video_frames(video_path, query_ts, self.tolerance_s, self.video_backend)
+diff --git a/lingbotvla/data/vla_data/transform.py b/lingbotvla/data/vla_data/transform.py
+index 05fe43f..5b31441 100644
+--- a/lingbotvla/data/vla_data/transform.py
++++ b/lingbotvla/data/vla_data/transform.py
+@@ -229,11 +229,27 @@ def sample_visual_augmentation_params(
+     """Sample one replayable augmentation config for all views/frames in a sample."""
+     _visual_hw(reference)
+     device = reference.device
+-    return {
++    params = {
+         "brightness": 0.7 + torch.rand((), device=device) * 0.6,
+         "contrast": 0.6 + torch.rand((), device=device) * 0.8,
+         "saturation": 0.5 + torch.rand((), device=device),
+     }
++    # lingbot competition: optional extra augmentations, enabled via LB_AUG_EXTRA="crop,cutout,noise"
++    # (default off = official behaviour). Sampled once per sample, replayed over views/frames like the colour jitter.
++    extra = _lb_aug_extra()
++    if "crop" in extra:  # random crop keeping 85-100% of each side, then resize back (camera / table shift)
++        sh, sw = 0.85 + torch.rand(2) * 0.15
++        params["crop"] = (float(sh), float(sw), float(torch.rand(())), float(torch.rand(())))
++    if "cutout" in extra:  # 0-2 grey rectangles, 5-20% of each side (clutter / occluders)
++        params["cutout"] = [tuple(float(x) for x in torch.rand(4)) for _ in range(int(torch.randint(0, 3, ())))]
++    if "noise" in extra:  # pixel noise sigma in [0, 0.03] (render noise; ARM SAPIEN has no OIDN denoiser)
++        params["noise"] = float(torch.rand(()) * 0.03)
++    return params
++
++
++def _lb_aug_extra():
++    import os
++    return {x.strip() for x in os.environ.get("LB_AUG_EXTRA", "").split(",") if x.strip()}
+ 
+ def apply_visual_augmentation(
+     visual: Tensor,
+@@ -268,6 +284,17 @@ def apply_visual_augmentation(
+     image = (image - mean) * contrast + mean
+     gray = image.mean(dim=1, keepdim=True)
+     image = gray + (image - gray) * saturation
++    if "crop" in params:
++        sh, sw, oy, ox = params["crop"]
++        ch, cw = max(1, int(round(height * sh))), max(1, int(round(width * sw)))
++        y0, x0 = int(round((height - ch) * oy)), int(round((width - cw) * ox))
++        image = F.interpolate(image[..., y0:y0 + ch, x0:x0 + cw], size=(height, width), mode="bilinear", align_corners=False)
++    for cy, cx, ch_f, cw_f in params.get("cutout", []):
++        ch, cw = int(height * (0.05 + 0.15 * ch_f)), int(width * (0.05 + 0.15 * cw_f))
++        y0, x0 = int((height - ch) * cy), int((width - cw) * cx)
++        image[..., y0:y0 + ch, x0:x0 + cw] = 0.5
++    if params.get("noise", 0.0) > 0:
++        image = image + torch.randn_like(image) * params["noise"]
+     image = image.clamp(0.0, 1.0)
+ 
+     if orig_dtype == torch.uint8:
+diff --git a/tasks/vla/train_lingbotvla.py b/tasks/vla/train_lingbotvla.py
+index a09c541..cd9b87f 100644
+--- a/tasks/vla/train_lingbotvla.py
++++ b/tasks/vla/train_lingbotvla.py
+@@ -1125,6 +1125,13 @@ def main():
+                 logger.info_rank0(f"Reached max_steps={args.train.max_steps}, stopping training.")
+                 reached_max_steps = True
+                 break
++            # lingbot competition: LB_STOP_AT_STEPS="4288,12864" pauses (exits cleanly) right after the checkpoint at
++            # one of these steps, so evaluation can run; resuming continues the same max_steps / LR schedule.
++            _lb_stops = {int(x) for x in os.environ.get("LB_STOP_AT_STEPS", "").split(",") if x.strip()}
++            if global_step in _lb_stops and args.train.save_steps and global_step % args.train.save_steps == 0:
++                logger.info_rank0(f"LB_STOP_AT_STEPS: pausing after checkpoint at step {global_step}.")
++                reached_max_steps = True
++                break
+ 
+         if not max_steps_driven:
+             data_loader_tqdm.close()
+diff --git a/assets/norm_stats/robotwin_clean.json b/assets/norm_stats/robotwin_clean.json
+new file mode 100644
+index 0000000..a93c993
+--- /dev/null
++++ b/assets/norm_stats/robotwin_clean.json
+@@ -0,0 +1,301 @@
++{
++  "norm_stats": {
++    "action.arm.position": {
++      "mean": [
++        -0.2315516471862793,
++        1.1448193788528442,
++        0.8348099589347839,
++        -0.34060725569725037,
++        0.06482663750648499,
++        -0.05661468580365181,
++        0.2614796459674835,
++        1.1940057277679443,
++        0.8835415840148926,
++        -0.35142186284065247,
++        -0.016934629529714584,
++        0.034650374203920364
++      ],
++      "std": [
++        0.30170002579689026,
++        0.9978452920913696,
++        0.792836606502533,
++        0.6971041560173035,
++        0.2594201862812042,
++        0.5761576294898987,
++        0.324471652507782,
++        1.0236756801605225,
++        0.8168908953666687,
++        0.7590184211730957,
++        0.28179410099983215,
++        0.6444393396377563
++      ],
++      "q01": [
++        -0.9567058563947678,
++        -0.0003164021181873977,
++        -0.0005466500937938712,
++        -1.618336992740631,
++        -0.44799130661487585,
++        -2.265631921005249,
++        -0.16261052346229565,
++        -0.0017608298778534204,
++        -0.001305444571375847,
++        -1.7110402277708054,
++        -1.0792608919143678,
++        -1.6363513648986816
++      ],
++      "q99": [
++        0.21229468801021567,
++        2.5728004339050967,
++        2.463160576272011,
++        1.3370873549461368,
++        1.254625638747215,
++        1.4483474727630616,
++        1.1985381264686579,
++        2.6345560644865036,
++        2.5233909558966756,
++        1.3396439454555509,
++        1.161912085342407,
++        2.284254536819458
++      ],
++      "q02": [
++        -0.9204492605626584,
++        -0.0003164021181873977,
++        -0.0005466500937938712,
++        -1.5380588665962218,
++        -0.3345631089925767,
++        -1.8118993663787841,
++        -0.07678013088703173,
++        -0.0017608298778534204,
++        -0.001305444571375847,
++        -1.6448067125082015,
++        -0.9537746040344238,
++        -1.5434279133319855
++      ],
++      "q98": [
++        0.17310826625227915,
++        2.494847737344855,
++        2.331762857532501,
++        1.2003172141075136,
++        1.0432909968614577,
++        1.2151085472106935,
++        0.9670561586141586,
++        2.5460363528966905,
++        2.3798284787476063,
++        1.2686794648170472,
++        0.8030334262847898,
++        1.8514603788375856
++      ],
++      "min": [
++        -1.3947148323059082,
++        -0.0003164021181873977,
++        -0.1190902441740036,
++        -1.9268131256103516,
++        -1.4216828346252441,
++        -3.468787908554077,
++        -2.9455959796905518,
++        -0.5742834806442261,
++        -0.005311839282512665,
++        -1.9893786907196045,
++        -1.6339466571807861,
++        -2.9398255348205566
++      ],
++      "max": [
++        0.4364263713359833,
++        3.3889312744140625,
++        3.4514999389648438,
++        1.789766788482666,
++        1.5632697343826294,
++        2.903860330581665,
++        1.3892723321914673,
++        2.9950597286224365,
++        3.333350419998169,
++        1.9530924558639526,
++        1.397123098373413,
++        3.4247944355010986
++      ]
++    },
++    "action.effector.position": {
++      "mean": [
++        0.6443039178848267,
++        0.6461191773414612
++      ],
++      "std": [
++        0.4630095064640045,
++        0.46199870109558105
++      ],
++      "q01": [
++        0.0,
++        0.0
++      ],
++      "q99": [
++        0.9998,
++        0.9998
++      ],
++      "q02": [
++        0.0,
++        0.0
++      ],
++      "q98": [
++        0.9998,
++        0.9998
++      ],
++      "min": [
++        0.0,
++        0.0
++      ],
++      "max": [
++        1.0,
++        1.0
++      ]
++    },
++    "observation.state.arm.position": {
++      "mean": [
++        -0.2166915237903595,
++        1.0891458988189697,
++        0.79395592212677,
++        -0.3320823013782501,
++        0.05963347107172012,
++        -0.04071604087948799,
++        0.23366935551166534,
++        1.1053649187088013,
++        0.8215513825416565,
++        -0.339979887008667,
++        -0.015037573873996735,
++        0.019349761307239532
++      ],
++      "std": [
++        0.29249539971351624,
++        0.9922698140144348,
++        0.7804903388023376,
++        0.6718841195106506,
++        0.24959933757781982,
++        0.5415616631507874,
++        0.31203892827033997,
++        1.0176650285720825,
++        0.8054100275039673,
++        0.7186067700386047,
++        0.2603883743286133,
++        0.5929630398750305
++      ],
++      "q01": [
++        -0.9548747151911259,
++        -0.0003164021181873977,
++        -0.0005466500937938712,
++        -1.588604353427887,
++        -0.44023042993545536,
++        -2.0820996517181394,
++        -0.147871971201897,
++        -0.0024746985197067195,
++        -0.001305444571375847,
++        -1.698424320101738,
++        -1.028945133972168,
++        -1.568886393213272
++      ],
++      "q99": [
++        0.17310826625227915,
++        2.570089035763871,
++        2.4481640975028274,
++        1.3199910873413088,
++        1.2068663976430893,
++        1.4292295280456546,
++        1.0624232614755629,
++        2.592437814617157,
++        2.480656078977883,
++        1.3025847166776656,
++        1.0515811462402342,
++        2.104772253656387
++      ],
++      "q02": [
++        -0.9105610980629921,
++        -0.0003164021181873977,
++        -0.0005466500937938712,
++        -1.5046096473693846,
++        -0.3262052417993546,
++        -1.5748368518829345,
++        -0.0681103942632677,
++        -0.0024746985197067195,
++        -0.001305444571375847,
++        -1.6030165183544158,
++        -0.8919407810211182,
++        -1.5396091413497925
++      ],
++      "q98": [
++        0.14893720236420616,
++        2.4894249410624036,
++        2.3046263721406457,
++        1.1490284112930298,
++        1.0032926324367524,
++        1.1768726577758786,
++        0.9453818170547486,
++        2.52462029364109,
++        2.33776133428067,
++        1.1992919726371762,
++        0.6866403476715086,
++        1.752172307300568
++      ],
++      "min": [
++        -1.3947148323059082,
++        -0.0003164021181873977,
++        -0.1190902441740036,
++        -1.9268131256103516,
++        -1.4216828346252441,
++        -3.468787908554077,
++        -2.9455959796905518,
++        -0.5742834806442261,
++        -0.005311839282512665,
++        -1.9893786907196045,
++        -1.6339466571807861,
++        -2.9398255348205566
++      ],
++      "max": [
++        0.4364263713359833,
++        3.3889312744140625,
++        3.4514999389648438,
++        1.789766788482666,
++        1.5632697343826294,
++        2.903860330581665,
++        1.3892723321914673,
++        2.9950597286224365,
++        3.333350419998169,
++        1.9530924558639526,
++        1.397123098373413,
++        3.4247944355010986
++      ]
++    },
++    "observation.state.effector.position": {
++      "mean": [
++        0.6729962229728699,
++        0.6736583113670349
++      ],
++      "std": [
++        0.4522095024585724,
++        0.4514705538749695
++      ],
++      "q01": [
++        0.0,
++        0.0
++      ],
++      "q99": [
++        0.9998,
++        0.9998
++      ],
++      "q02": [
++        0.0,
++        0.0
++      ],
++      "q98": [
++        0.9998,
++        0.9998
++      ],
++      "min": [
++        0.0,
++        0.0
++      ],
++      "max": [
++        1.0,
++        1.0
++      ]
++    }
++  },
++  "count": 548893
++}
+\ No newline at end of file
+diff --git a/configs/robot_configs/robotwin_clean.yaml b/configs/robot_configs/robotwin_clean.yaml
+new file mode 100644
+index 0000000..3fa5e42
+--- /dev/null
++++ b/configs/robot_configs/robotwin_clean.yaml
+@@ -0,0 +1,49 @@
++states:
++  - observation.state.arm.position:
++      origin_keys:
++        - observation.state:
++            start: 0
++            end: 6
++        - observation.state:
++            start: 7
++            end: 13
++
++  - observation.state.effector.position: 
++      origin_keys:
++        - observation.state:
++            start: 6
++            end: 7
++        - observation.state:
++            start: 13
++            end: 14
++
++actions:
++  - action.arm.position: 
++      origin_keys:
++          - action:
++              start: 0
++              end: 6
++          - action:
++              start: 7
++              end: 13
++      subtract_state: False
++
++  - action.effector.position: 
++      origin_keys:
++          - action:
++              start: 6
++              end: 7
++          - action:
++              start: 13
++              end: 14
++      subtract_state: False
++  
++images:
++  - observation.images.camera_top: 
++      origin_keys:  observation.images.cam_high
++  - observation.images.camera_wrist_left: 
++      origin_keys: observation.images.cam_left_wrist
++  - observation.images.camera_wrist_right: 
++      origin_keys: observation.images.cam_right_wrist
++
++norm_stats: assets/norm_stats/robotwin_clean.json

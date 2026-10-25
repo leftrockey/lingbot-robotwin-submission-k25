@@ -1,0 +1,12 @@
+{
+  "file_format_version": "1.1.2",
+  "layer": {
+    "name": "VK_LAYER_LB_device_select",
+    "type": "GLOBAL",
+    "library_path": "/iopsstor/scratch/cscs/zzixiang/Research/lingbot/shim/vklayer/libVkLayer_LB_device_select.so",
+    "api_version": "1.3.0",
+    "implementation_version": "1",
+    "description": "Restrict to CUDA_VISIBLE_DEVICES GPU; pciDomain:=pciBus for SAPIEN CPU-only builds",
+    "functions": {"vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"}
+  }
+}

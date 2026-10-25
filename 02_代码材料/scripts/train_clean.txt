@@ -1,0 +1,1 @@
+robotwin_clean /path/to/data/lerobot_clean_v30

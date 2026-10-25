@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.orig
+*.bak
+.DS_Store
+03_模型权重/
+*.zip
+*.safetensors
