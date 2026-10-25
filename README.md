@@ -76,7 +76,29 @@ docs/EXPERIMENTS.md                      关键实验结论速览
 
 单节点 **1 × NVIDIA RTX PRO 6000 Blackwell（96 GB, x86_64）**，Ubuntu 22.04，Python 3.12，torch 2.8.0+cu128，驱动 580.95.05，SAPIEN 3.0.0b1 / mplib 0.2.1 / curobo v0.7.8，flash-attn 2.8.3。渲染参数保持官方默认（`samples_per_pixel=32`、`path_depth=8`、denoiser `oidn`）。
 
-**环境差异说明**：上一版提交在 4 × GH200（aarch64）上完成。同一 checkpoint、同一 K 值下，x86 在 clean 上高约 **+11pp**，randomized 上几乎相同（−0.97pp）——clean 场景对渲染路径更敏感。最终成绩以主办方复测为准。
+**环境差异说明**：上一版提交在 4 × GH200（aarch64）上完成。同一 checkpoint、同一 K 值下，x86 在 clean 上高约 **+11pp**（16 难任务）／**+23pp**（其余 34 个任务），randomized 上几乎相同（−0.97pp）——clean 场景对渲染路径更敏感。最终成绩以主办方复测为准。
+
+#### 跨平台结果对照
+
+| 来源 | 权重 | 平台 | 架构 | 推理 K | clean | randomized |
+|---|---|---|---|---|---|---|
+| 官方后训练权重 | `lingbot-vla-v2-6b-robotwin` | 本机 x86 | x86_64 | 50 | ≈80%（6 任务） | — |
+| **上一版提交** | `main_aug/51456` | 4 × GH200 | **aarch64** | 50 | **58.98%** | **40.68%** |
+| **本版提交** | **同一 checkpoint** | **1 × RTX PRO 6000** | **x86_64** | **25** | **78.18%** | **49.34%** |
+| 第三方公开记录 | 自训 step 15k | 8 × H100 | x86_64 | 50 | 79.56% | 未提交（0/0） |
+
+三个独立的 x86_64 + NVIDIA 结果集中在 **78–80%**，唯一的 aarch64 结果为 58.98%。据此判断：clean 上约 20pp 的差距来自平台（aarch64 的 Vulkan 渲染路径），而非推理参数改动。
+
+#### 效应分解（本机实测，16 个最难任务，配对种子）
+
+| 效应 | clean | randomized |
+|---|---|---|
+| K=25 vs K=50（同机） | −0.67pp（不显著） | **+4.03pp**（McNemar p<0.05） |
+| x86 vs GH200（同 K=50） | **+11.1pp**（难任务）／**+23.3pp**（其余 34 任务） | −0.97pp |
+
+**本版提交的真实改进是 randomized +4pp；clean 的差值是平台差异，不是调优结果。**
+
+> 补充：上一版提交的 README 未披露评测环境，本版已在 `02_代码材料/README.md` 的 `## Evaluation environment` 章节补齐。
 
 ## 复现
 
