@@ -1,5 +1,8 @@
 # LingBot-VLA 2.0 × RoboTwin 2.0 — Tianchi preliminary submission (team 具身天命人, 1386132)
 
+> ⚠️ **提交次数提醒**：初赛累计仅 **3 次**提交机会（非每日 3 次）。本仓库内容为提交前快照，**任何再次上传 OSS 前必须确认剩余次数**。详见 [`docs/POSTMORTEM.md`](docs/POSTMORTEM.md) 第 5.1 节。
+
+
 蚂蚁灵波具身大模型挑战赛（天池）初赛提交材料 — **K=25 推理配置版**。
 
 > **权重文件不在本仓库**（23 GB，超出 GitHub 限制）。
